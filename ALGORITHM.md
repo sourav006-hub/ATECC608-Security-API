@@ -9,26 +9,6 @@
 
 ---
 
-## Contents
-
-| § | Section |
-|---|---------|
-| 1 | Purpose |
-| 2 | Methodology |
-| 3 | System Architecture (Module Map) |
-| 4 | Global Notation & Conventions |
-| 5 | Layer 1 — Cryptographic Primitive Algorithms |
-| 6 | Layer 2 — Core Orchestration Algorithms |
-| 7 | Layer 3 — API Endpoint Algorithms |
-| 8 | Master End-to-End Algorithms |
-| 9 | Application Startup Algorithm |
-| 10 | Complexity Analysis |
-| 11 | Validation Algorithm (Test Suite) |
-| 12 | Implementation Observations & Algorithm-Level Gaps |
-| 13 | Quick Reference — Algorithm–File Index |
-
----
-
 ## 1. Purpose
 
 This document specifies the algorithm for every module of the Security API.
@@ -46,369 +26,7 @@ to IoT and blockchain clients:
 
 ---
 
-## 2. METHODOLOGY
-
-This chapter describes the methodology used to design, implement, test and
-evaluate the ATECC608 Security API. It explains *why* the algorithms are
-structured the way they are, and how the design was validated.
-
-### 2.1 Guiding Design Philosophy
-
-Five principles drove every design decision:
-
-| # | Principle | How it is realised in this project |
-|---|-----------|-------------------------------------|
-| P1 | **Do not roll your own crypto** | All primitives delegate to the vetted `cryptography` (OpenSSL) library — no hand-written curve arithmetic or padding |
-| P2 | **Separation of concerns** | A strict three-layer architecture (§3): routes only handle HTTP, services only handle mathematics |
-| P3 | **Fail-safe defaults** | Missing key → `404`; out-of-range length → `400`; tampered signature → `valid:false` — never a silent success |
-| P4 | **Minimal attack surface** | Nine endpoints only; private keys never leave the process; API keys stored only as SHA-256 digests |
-| P5 | **Verifiability** | Every algorithm is written as explicit, numbered pseudocode that can be checked against the source line by line |
-
-### 2.2 Requirement Analysis
-
-#### 2.2.1 Functional Requirements
-
-| ID | Requirement | Delivered by |
-|----|-------------|--------------|
-| FR1 | Generate an ECC key pair on demand | `POST /api/v1/keys/generate` |
-| FR2 | Retrieve a public key by identifier | `GET /api/v1/keys/{key_id}` |
-| FR3 | Produce a SHA-256 digest of arbitrary text | `POST /api/v1/hash/sha256` |
-| FR4 | Sign data with a private key (ECDSA) | `POST /api/v1/ecdsa/sign` |
-| FR5 | Verify a signature against a key (ECDSA) | `POST /api/v1/ecdsa/verify` |
-| FR6 | Derive a shared secret between two parties (ECDH) | `POST /api/v1/ecdh/derive` |
-| FR7 | Supply cryptographically secure random bytes | `POST /api/v1/random/generate` |
-| FR8 | Issue and verify API keys for client authentication | `POST /api/v1/auth/api-key`, `core/auth.py` |
-
-#### 2.2.2 Non-Functional Requirements
-
-| ID | Requirement | Target | Status |
-|----|-------------|--------|--------|
-| NFR1 | Constant-time lookups regardless of key count | O(1) per operation | ✅ dict-indexed stores (§10) |
-| NFR2 | Private keys must never be serialised | 0 occurrences | ✅ only PEM public keys are exported |
-| NFR3 | Randomness must come from the OS CSPRNG | no `random` module in security paths | ✅ `secrets` used throughout |
-| NFR4 | Errors must not leak internals | structured JSON only | ✅ `InvalidSignature` absorbed in Layer 1 |
-| NFR5 | Input must be validated at the boundary | Pydantic + explicit guards | ✅ schemas + 400/404 checks |
-| NFR6 | Behaviour must be reproducible for verification | automated test suite | ✅ 17 tests (§11) |
-
-### 2.3 Development Methodology
-
-The system was built using an **incremental, bottom-up** methodology: each
-cryptographic primitive was implemented and verified *before* the layer that
-consumes it. This ordering guarantees that no route is ever written against a
-primitive that does not yet work.
-
-| Phase | Activity | Output |
-|-------|----------|--------|
-| 1. Requirement Analysis | Identify primitives and constraints (§2.2) | FR / NFR tables |
-| 2. Technology Selection | Choose Python + FastAPI + `cryptography` (§2.7) | stack decision |
-| 3. Architectural Design | Define the three layers and the dependency rule (§3) | module map |
-| 4. Primitive Implementation | Build Layer 1 (services) and verify each | 7 crypto primitives |
-| 5. Orchestration | Build Layer 2 facades, auth and stores | KeyManager, SecurityEngine |
-| 6. Exposure | Build Layer 3 routes + Pydantic schemas | 9 endpoints |
-| 7. Integration | Register routers, serve the dashboard | `app/main.py` |
-| 8. Verification | Black-box test suite over the live application | 17 passing tests |
-| 9. Documentation | Write this algorithm specification | `ALGORITHM.md` |
-
-**Why bottom-up?** Every layer is then testable in isolation, and a defect is
-localised to the layer where it first appears. This is what made the package
-layout problem (§12.1) a single-line diagnosis rather than a search.
-
-### 2.4 System Design Methodology
-
-#### 2.4.1 Layered Architecture
-
-The design follows a strict **three-tier** model with a one-way dependency
-rule: *a layer may call only the layer directly beneath it.*
-
-```
-Layer 3  API / Routes      ->  HTTP parsing, status codes, JSON shaping
-Layer 2  Core / Facades    ->  orchestration, access control, stores
-Layer 1  Services          ->  pure cryptographic operations
-                              (dependency flows upward only)
-```
-
-**Rationale:** cryptographic code is the hardest to get right and the easiest
-to break. By isolating it in Layer 1 — with no HTTP, no exception handling and
-no global state — it can be reasoned about and replaced independently of the
-web framework.
-
-#### 2.4.2 Facade Pattern
-
-Two facades hide the internals from the routing layer:
-
-- **`SecurityEngine` (§6.2)** — a single entry point exposing *all* primitives.
-  Every method is a `@staticmethod`, so the engine is stateless and trivially
-  thread-safe.
-- **`KeyManager` (§6.1)** — the only sanctioned route-facing gateway for key
-  operations, with an explicit split between the private-key-bearing
-  `get_key()` (internal use) and the safe `get_public_key()` (public use).
-
-Consequently Layer 3 never imports `cryptography` and never handles a private
-key object directly.
-
-#### 2.4.3 Invariant-Driven Design
-
-Rather than relying on convention, five invariants (§4) are stated explicitly
-and each algorithm is written so the invariant is a direct consequence of its
-steps:
-
-- **I1** (private keys never serialised) holds because the only serialization
-  call in the codebase is applied to a `public_key` object.
-- **I4** (CSPRNG only) holds because every entropy request routes through
-  `secrets` / `os.urandom`, and no algorithm ever imports `random`.
-- **I5** (errors converted at the boundary) holds because `InvalidSignature`
-  is caught in Layer 1 and returned as a boolean.
-
-#### 2.4.4 Storage Design
-
-State is held in two module-level dictionaries:
-
-| Store | Key | Value |
-|-------|-----|-------|
-| `_key_store` | `uuid4()` string | `{private_key, public_key}` objects |
-| `_api_key_store` | `SHA256(api_key)` | `{key_id, active}` |
-
-Design choices and their justification:
-
-- **Keys are addressed by opaque ID, never by key material** — keeps URLs and
-  logs free of secret data and avoids accidental leakage.
-- **Objects are stored, not byte copies (I3)** — the 256-bit scalar exists
-  once and is never duplicated, limiting memory exposure.
-- **The API-key store is keyed by digest, not by the raw key** — so a store
-  disclosure yields no usable credential (§5.8).
-- **An `active` flag enables revocation without deletion** — preserving an
-  audit trail for a future persistence backend.
-
-The known consequence — that these stores are volatile and per-process — is
-recorded honestly in §12.5.
-
-### 2.5 Cryptographic Primitive Selection & Justification
-
-Each primitive was chosen against explicit criteria rather than convenience.
-The dominant constraint is the target hardware: the **Microchip ATECC608A**
-secure element (the subject of the project title) natively accelerates the
-NIST **P-256** curve, ECDSA, ECDH and SHA-256.
-
-| Layer | Chosen | Alternatives considered | Justification |
-|-------|--------|--------------------------|---------------|
-| Curve | **NIST P-256** (`secp256r1`) | `secp256k1`, Curve25519 | Hardware-accelerated by the ATECC608A; FIPS 186-4 approved; `secp256k1` is Bitcoin-specific, and Curve25519 cannot do ECDSA |
-| Hash | **SHA-256** | MD5, SHA-1, SHA-3 | MD5/SHA-1 are collision-broken; SHA-256 matches the 256-bit curve (matched security strength) and is FIPS 180-4 approved |
-| Signature | **ECDSA** | RSA-2048/3072 | 256-bit ECDSA ≈ 3072-bit RSA security with a far smaller key and a ~64-byte signature — critical for IoT bandwidth and storage |
-| Agreement | **ECDH** (ephemeral) | RSA key transport, finite-field DH | Natural pairing with P-256; one scalar multiplication per side, and the secret is never transmitted |
-| Entropy | **`secrets`** (OS CSPRNG) | `random`, timestamps, counters | `random` uses the Mersenne Twister, which is *predictable* once enough outputs are observed — unacceptable for key material |
-| API-key storage | **SHA-256 digest** | bcrypt, scrypt, Argon2 | See the nuance below |
-
-#### 2.5.1 A deliberate nuance: why a *fast* hash is correct for API keys
-
-Password-storage best practice calls for slow, memory-hard functions (bcrypt /
-Argon2). That guidance does **not** apply here, and the reasoning belongs in
-the report:
-
-- A password is **low-entropy** and *guessable*, so an attacker who steals the
-  digest mounts an offline dictionary attack. Slowness is what defends it.
-- A generated API key is `sk_live_` + `secrets.token_urlsafe(32)` ≈ **256 bits
-  of uniform entropy**. Brute-forcing it is infeasible regardless of hash
-  speed, so a slow hash would add latency to *every authenticated request* while
-  buying no practical security.
-
-Therefore SHA-256 is the **correct** choice for this threat model. Stating this
-explicitly demonstrates that the decision was reasoned, not accidental.
-
-### 2.6 Algorithm Specification Method
-
-Every operation is documented using one uniform, checkable form:
-
-```
-ALGORITHM <Name>(<inputs>)
-BEGIN
-  Step 1. <action>              // rationale for this step
-  ...
-  Step n. RETURN <output>
-END
-```
-
-Each specification carries four supporting elements:
-
-| Element | Purpose |
-|---------|---------|
-| **Input / Output** | The exact contract of the function |
-| **Time / Space** | Complexity class and dominant cost (§10) |
-| **Correctness argument** | *Why* the step sequence achieves the stated goal (e.g. the ECDH symmetry proof in §5.7) |
-| **Invariant note** | Which of I1–I5 the algorithm upholds, and by which step |
-
-#### 2.6.1 Traceability
-
-The specification is deliberately machine-checkable against the source:
-
-- Each algorithm is annotated with its `file :: symbol` location.
-- §13 (Algorithm–File Index) maps every algorithm ID to its implementing file
-  and function, so a reviewer can verify each one in isolation.
-- The pseudocode names the *actual* library calls (`EC.generate_private_key`,
-  `hashlib.sha256`, `secrets.token_bytes`) rather than abstract placeholders,
-  so the mapping from specification to code is one-to-one.
-
-#### 2.6.2 What is specified beyond the code
-
-Two things are documented that the source does not state explicitly:
-
-1. **The textbook algorithm inside library calls.** For example, `PrivateKey.sign()`
-   is a single line in the code but is specified in §5.5 as the full ECDSA
-   equations (`r = (k·G).x mod n`, `s = k⁻¹(e + r·d) mod n`) because the
-   security of the whole system depends on `k` being uniformly random and
-   secret — a property the one-line call conceals.
-2. **The invariants.** §4 formalises the five implicit design rules (I1–I5) as
-   testable claims, converting informal good practice into checkable
-   requirements.
-
-### 2.7 Technology Stack & Tools
-
-| Component | Technology | Version | Role |
-|-----------|-----------|---------|------|
-| Language | Python | 3.11.9 | Implementation language |
-| Web framework | FastAPI | 0.142.2 | Routing, dependency injection, OpenAPI generation |
-| ASGI server | Uvicorn | 0.54.0 | Serves the application (`--reload` in development) |
-| Cryptography | `cryptography` (OpenSSL) | 50.0.2 | All primitives — EC keys, ECDSA, ECDH |
-| Validation | Pydantic | 2.13.5 | Request-schema parsing and type enforcement |
-| Testing | pytest + `TestClient` (httpx) | 9.1.1 / 0.28.1 | In-process black-box test suite |
-| Version control | Git + GitHub | 2.55.0 | Source management and publication |
-| Documentation | Markdown | — | This specification and the `README.md` |
-
-Environment setup:
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2.8 Testing & Validation Methodology
-
-#### 2.8.1 Strategy: black-box, contract-first
-
-Tests exercise the application through `fastapi.testclient.TestClient` — an
-in-process HTTP client — rather than calling service functions directly. This
-is a deliberate methodological choice:
-
-- It validates the **public contract** (status codes, JSON shape, field names),
-  which is what a real client actually depends on.
-- It drives **all three layers** on every test, so a defect anywhere on the
-  request path is caught.
-- It needs **no network**, so the suite is fast (≈ 1 s) and deterministic.
-
-A consequence worth stating: refactoring the internals cannot break these tests
-unless it also breaks the contract — precisely the property that is wanted.
-
-#### 2.8.2 Test-design techniques applied
-
-| Technique | Where it appears |
-|-----------|------------------|
-| **Equivalence partitioning** | Inputs divided into valid / invalid classes |
-| **Boundary-value analysis** | `length = 0` (just below minimum), `length = 1025` (just above maximum), `length = 16 / 32` (valid) |
-| **Positive (happy-path) testing** | Key generation, hashing, valid sign → verify |
-| **Negative testing** | Tampered data, unknown key IDs, out-of-range lengths |
-| **Property testing** | Symmetry (`S_A == S_B`), determinism, non-determinism, uniqueness |
-
-#### 2.8.3 The verification loop
-
-Verification was iterative, and the loop is itself part of the methodology:
-
-1. **Implement** the primitive.
-2. **Specify** it as pseudocode (§5–§8).
-3. **Test** it through the API (§11).
-4. **Reconcile** — any disagreement between specification, code and observed
-   result is a defect in one of the three, and all three are corrected together.
-
-This loop is exactly what surfaced the implementation gaps in §12 (the missing
-`app/` package and the unmounted `auth` router): each was detected by a *failing
-test*, then fixed and re-verified. The suite went from an import error to
-**17 passed**.
-
-#### 2.8.4 Coverage summary
-
-| Layer / concern | How it is exercised |
-|-----------------|---------------------|
-| Layer 1 — services | Indirectly, through every endpoint |
-| Layer 2 — core / auth | `KeyManager` (all key tests), API-key flow |
-| Layer 3 — routes | All 9 endpoints |
-| Guard conditions | 2 × `400` (length bounds), 2 × `404` (unknown keys) |
-| Cryptographic properties | Symmetry, soundness, completeness, non-determinism |
-
-The full property-by-property mapping of the 17 tests appears in §11.
-
-### 2.9 Security Evaluation Methodology
-
-The design was evaluated against an explicit threat model rather than by
-intuition. The method has four steps:
-
-1. Enumerate the **assets** worth protecting.
-2. Enumerate the **adversary's capabilities**.
-3. State the **security criteria** (confidentiality, integrity, authenticity,
-   non-repudiation, availability).
-4. Map each threat to a **mitigation**, and record any **residual risk**.
-
-#### 2.9.1 Assets
-
-| Asset | Where it lives | Confidentiality requirement |
-|-------|----------------|-----------------------------|
-| Private keys (scalar `d`) | `_key_store`, in memory only | Critical — must never leave the process |
-| Shared secrets (ECDH) | Returned to the requester, transient | Critical |
-| API keys (raw) | Returned once, never stored | Critical |
-| API-key digests | `_api_key_store` | Low — one-way hashes |
-| Key identifiers | Returned / stored | Public |
-
-#### 2.9.2 Threat model and mitigations
-
-| # | Threat | Mitigation in this design |
-|---|--------|---------------------------|
-| T1 | Key exfiltration via an API response | Responses expose only PEM public keys; I1 is enforced structurally (§6.1) |
-| T2 | Store disclosure (memory dump / backup) | API keys are stored only as SHA-256 digests (§5.8) |
-| T3 | Signature forgery | ECDSA over P-256 — forgery is equivalent to solving the ECDLP |
-| T4 | **ECDSA nonce reuse** (which leaks `d`) | `k` is drawn from the OS CSPRNG on every signature; low-S normalisation (§5.5) |
-| T5 | Message tampering | Detectable — `verify` returns `false` (§7.6) |
-| T6 | Weak / predictable randomness | Only `secrets` (OS CSPRNG) is used; `random` is never imported (I4) |
-| T7 | Invalid-curve point injection into ECDH | Peer keys resolve only from the server's own store; OpenSSL validates the point (§7.7) |
-| T8 | Resource exhaustion (DoS) | `length` is bounded to ≤ 1024 bytes (§7.3) |
-| T9 | Key-ID enumeration | A uniform `404` is returned for any unknown ID (§7.2) |
-| T10 | Information leakage via errors | `InvalidSignature` is absorbed in Layer 1; no stack traces (I5) |
-| T11 | Man-in-the-middle on ECDH | **Residual risk** — raw ECDH is unauthenticated (see §2.10) |
-
-#### 2.9.3 Evaluation criteria
-
-| Criterion | How the design meets it |
-|-----------|-------------------------|
-| **Confidentiality** | Keys stay in-process; API keys are hashed; the ECDH secret is never transmitted |
-| **Integrity** | SHA-256 digests; tampering is detectable through signature verification |
-| **Authenticity** | ECDSA signatures; API-key authentication |
-| **Non-repudiation** | An ECDSA signature binds a message to the holder of the key |
-| **Availability** | Bounded inputs, O(1) key lookups, stateless engine |
-
-### 2.10 Limitations & Assumptions
-
-Stating these explicitly is part of the methodology — an evaluation that hides
-its scope is not an evaluation.
-
-**Assumptions:**
-
-1. The host running the API is trusted and the process is not compromised
-   (an in-memory key store cannot defend against a memory-level attacker).
-2. The `cryptography` / OpenSSL implementation is correct.
-3. A single application process owns the store.
-4. In production the API is served behind **TLS (HTTPS)**; on its own it speaks
-   plain HTTP.
-
-**Known limitations:**
-
-| # | Limitation | Impact | Reference |
-|---|-----------|--------|-----------|
-| L1 | Key and API-key stores are volatile and per-process | State is lost on restart; unusable with multiple workers | §12.5 |
-| L2 | Raw ECDH is unauthenticated | Vulnerable to MITM unless public keys are authenticated out-of-band | §7.7 |
-| L3 | The API-key dependency is not yet applied to routes | Endpoints are currently reachable without a key | §12.4 |
-| L4 | No rate limiting / throttling | Brute-force and DoS are only partially mitigated | — |
-| L5 | No key rotation, expiry or revocation for key pairs | A leaked private key cannot be retired | §12.5 |
-| L6 | No audit logging | Failures are not recorded for forensic review | — |
-
-These are recorded as **scope boundaries, not defects** — each is a deliberate
-deferral to the persistence / secure-element stage of the project.
-
-## 3. System Architecture (Module Map)
+## 2. System Architecture (Module Map)
 
 The system is a strict **3-layer architecture**. A layer may only call the
 layer directly below it. No route ever touches cryptographic objects directly.
@@ -454,7 +72,7 @@ the diagram above are relative to it); `tests/` sits at the project root:
 
 ---
 
-## 4. Global Notation & Conventions
+## 3. Global Notation & Conventions
 
 | Symbol | Meaning |
 |--------|---------|
@@ -486,9 +104,9 @@ the diagram above are relative to it); `tests/` sits at the project root:
 
 ---
 
-## 5. LAYER 1 — Cryptographic Primitive Algorithms
+## 4. LAYER 1 — Cryptographic Primitive Algorithms
 
-### 5.1 ALG-GENKEY — ECC Key Pair Generation
+### 4.1 ALG-GENKEY — ECC Key Pair Generation
 `services/key_service.py :: generate_key_pair()`
 
 **Input:** none
@@ -517,7 +135,7 @@ so collision probability is negligible (`~2^-122` at practical volumes).
 
 ---
 
-### 5.2 ALG-GETPUB — Public Key Retrieval
+### 4.2 ALG-GETPUB — Public Key Retrieval
 `services/key_service.py :: get_public_key(key_id)`
 
 **Input:** `key_id`
@@ -538,7 +156,7 @@ END
 
 ---
 
-### 5.3 ALG-RAND — Cryptographically Secure Random Bytes
+### 4.3 ALG-RAND — Cryptographically Secure Random Bytes
 `services/random_service.py :: generate_random_bytes(length)`
 
 **Input:** `length` (int)
@@ -558,7 +176,7 @@ non-deterministic value (tested: two calls of length 32 differ).
 
 ---
 
-### 5.4 ALG-SHA — SHA-256 Hashing
+### 4.4 ALG-SHA — SHA-256 Hashing
 `services/hash_service.py :: sha256_hash(data)`
 
 **Input:** `data` (str)
@@ -579,7 +197,7 @@ avalanche effect (1-bit change ⇒ ~50% of digest bits flip).
 
 ---
 
-### 5.5 ALG-SIGN — ECDSA Signature Generation
+### 4.5 ALG-SIGN — ECDSA Signature Generation
 `services/ecdsa.py :: sign_data(private_key, data)`
 
 **Input:** `private_key` (object), `data` (str)
@@ -606,7 +224,7 @@ END
 
 ---
 
-### 5.6 ALG-VERIFY — ECDSA Signature Verification
+### 4.6 ALG-VERIFY — ECDSA Signature Verification
 `services/ecdsa.py :: verify_signature(public_key, data, signature_hex)`
 
 **Input:** `public_key` (object), `data` (str), `signature_hex` (str)
@@ -635,7 +253,7 @@ which prevents differential/oracle probing.
 
 ---
 
-### 5.7 ALG-ECDH — Shared Secret Derivation
+### 4.7 ALG-ECDH — Shared Secret Derivation
 `services/ecdh.py :: derive_shared_secret(private_key, peer_public_key)`
 
 **Input:** own `SK_A`, peer `PK_B`
@@ -666,7 +284,7 @@ exactly what `test_ecdh_shared_secret_matches` verifies.
 
 ---
 
-### 5.8 ALG-APIKEY-GEN — API Key Issuance
+### 4.8 ALG-APIKEY-GEN — API Key Issuance
 `core/api_key.py :: generate_api_key()`
 
 **Input:** none
@@ -692,7 +310,7 @@ automated secret scanners to detect accidental leakage.
 
 ---
 
-### 5.9 ALG-APIKEY-VERIFY — API Key Verification
+### 4.9 ALG-APIKEY-VERIFY — API Key Verification
 `core/api_key.py :: verify_api_key(api_key)`
 
 **Input:** `api_key` (str)
@@ -715,9 +333,9 @@ constant-time keyed lookup with no per-key scan. The `active` flag supports
 
 ---
 
-## 6. LAYER 2 — Core Orchestration Algorithms
+## 5. LAYER 2 — Core Orchestration Algorithms
 
-### 6.1 ALG-KEYMGR — Key Manager Facade
+### 5.1 ALG-KEYMGR — Key Manager Facade
 `core/key_manager.py :: class KeyManager`
 
 **Role:** the *only* permitted entry point for key operations from routes.
@@ -726,7 +344,7 @@ It wraps `services/key_service.py` so routes never import crypto internals.
 ```
 ALGORITHM KeyManager.generate_key()
 BEGIN
-  Step 1. RETURN Generate_Key_Pair()          // §5.1
+  Step 1. RETURN Generate_Key_Pair()          // §4.1
 END
 
 ALGORITHM KeyManager.get_key(key_id)          // INTERNAL use only
@@ -736,7 +354,7 @@ END
 
 ALGORITHM KeyManager.get_public_key(key_id)   // PUBLIC use
 BEGIN
-  Step 1. RETURN Get_Public_Key(key_id)       // §5.2 — PK only
+  Step 1. RETURN Get_Public_Key(key_id)       // §4.2 — PK only
 END
 ```
 
@@ -747,20 +365,20 @@ codebase, hence the explicit split and naming.
 
 ---
 
-### 6.2 ALG-ENGINE — Security Engine (Single Cryptographic Facade)
+### 5.2 ALG-ENGINE — Security Engine (Single Cryptographic Facade)
 `core/security_engine.py :: class SecurityEngine`
 
 **Role:** one class exposing *all* primitives, so a future hardware backend
 (the ATECC608 secure element itself) can be dropped in without touching routes.
 
 ```
-ALGORITHM SecurityEngine.generate_key()      → Generate_Key_Pair()      §5.1
-ALGORITHM SecurityEngine.get_public_key(k)   → Get_Public_Key(k)        §5.2
-ALGORITHM SecurityEngine.generate_random(n)  → Generate_Random_Bytes(n) §5.3
-ALGORITHM SecurityEngine.hash_sha256(d)      → SHA256(d)                §5.4
-ALGORITHM SecurityEngine.sign(SK, d)         → ECDSA_Sign(SK, d)        §5.5
-ALGORITHM SecurityEngine.verify(PK, d, s)    → ECDSA_Verify(PK, d, s)   §5.6
-ALGORITHM SecurityEngine.derive_secret(SK,Q) → ECDH_Derive(SK, Q)       §5.7
+ALGORITHM SecurityEngine.generate_key()      → Generate_Key_Pair()      §4.1
+ALGORITHM SecurityEngine.get_public_key(k)   → Get_Public_Key(k)        §4.2
+ALGORITHM SecurityEngine.generate_random(n)  → Generate_Random_Bytes(n) §4.3
+ALGORITHM SecurityEngine.hash_sha256(d)      → SHA256(d)                §4.4
+ALGORITHM SecurityEngine.sign(SK, d)         → ECDSA_Sign(SK, d)        §4.5
+ALGORITHM SecurityEngine.verify(PK, d, s)    → ECDSA_Verify(PK, d, s)   §4.6
+ALGORITHM SecurityEngine.derive_secret(SK,Q) → ECDH_Derive(SK, Q)       §4.7
 ```
 
 **Every method is `@staticmethod`** ⇒ the engine has no state of its own and
@@ -768,7 +386,7 @@ is trivially thread-safe; all state lives in the two stores.
 
 ---
 
-### 6.3 ALG-REQAUTH — API-Key Authorization Dependency
+### 5.3 ALG-REQAUTH — API-Key Authorization Dependency
 `core/auth.py :: require_api_key()`
 
 **Role:** FastAPI dependency (`Security(APIKeyHeader("X-API-Key"))`) that
@@ -785,7 +403,7 @@ BEGIN
   Step 2. IF api_key IS MISSING / EMPTY THEN
             RAISE HTTP_401 "Missing API key"
           END IF
-  Step 3. IF Verify_API_Key(api_key) = FALSE THEN  // §5.9
+  Step 3. IF Verify_API_Key(api_key) = FALSE THEN  // §4.9
             RAISE HTTP_401 "Invalid API key"
           END IF
   Step 4. RETURN api_key                       // caller is now authorized
@@ -799,13 +417,13 @@ END
 - Returning `api_key` at `Step 4` lets a protected route bind the request to
   an identity for logging/rate-limiting/auditing.
 - The dependency is **not** a decorator side-effect: it must be attached via
-  `Depends(require_api_key)` on each route to take effect (see §12.4).
+  `Depends(require_api_key)` on each route to take effect.
 
 ---
 
-## 7. LAYER 3 — API Endpoint Algorithms
+## 6. LAYER 3 — API Endpoint Algorithms
 
-### 7.0 ALG-PIPELINE — Common Request Pipeline
+### 6.0 ALG-PIPELINE — Common Request Pipeline
 Every endpoint follows this uniform control flow:
 
 ```
@@ -815,7 +433,7 @@ BEGIN
   Step 2. VALIDATE ← Pydantic parses `body` into the declared schema;
                      IF invalid THEN RETURN 422 (automatic, before handler)
   Step 3. AUTH     ← IF Depends(Require_API_Key) attached
-                     THEN run §6.3, abort with 401
+                     THEN run §5.3, abort with 401
   Step 4. BIND     ← map schema fields → service arguments
   Step 5. DOMAIN   ← call Layer 2 / Layer 1 (no crypto inline in route)
   Step 6. GUARD    ← IF resource missing THEN RETURN 404
@@ -830,25 +448,25 @@ END
 
 ---
 
-### 7.1 ALG-EP-KEYGEN — `POST /api/v1/keys/generate`
+### 6.1 ALG-EP-KEYGEN — `POST /api/v1/keys/generate`
 `api/routes/keys.py :: generate_keys()`
 
 ```
 ALGORITHM Endpoint_Generate_Keys()
 BEGIN
-  Step 1. result ← KeyManager.generate_key()     // §6.1
+  Step 1. result ← KeyManager.generate_key()     // §5.1
   Step 2. RETURN 200 result                      // {key_id, algorithm, curve,
                                                  //  public_key}  — never SK
 END
 ```
 
-### 7.2 ALG-EP-KEYGET — `GET /api/v1/keys/{key_id}`
+### 6.2 ALG-EP-KEYGET — `GET /api/v1/keys/{key_id}`
 `api/routes/keys.py :: retrieve_public_key(key_id)`
 
 ```
 ALGORITHM Endpoint_Get_Public_Key(key_id)
 BEGIN
-  Step 1. key_data ← KeyManager.get_public_key(key_id)    // §6.1
+  Step 1. key_data ← KeyManager.get_public_key(key_id)    // §5.1
   Step 2. IF key_data = NULL THEN
             RAISE HTTP_404 "Key not found"                // enumeration guard
           END IF
@@ -861,7 +479,7 @@ so the endpoint does not leak which IDs exist beyond membership itself.
 
 ---
 
-### 7.3 ALG-EP-RANDOM — `POST /api/v1/random/generate?length=N`
+### 6.3 ALG-EP-RANDOM — `POST /api/v1/random/generate?length=N`
 `api/routes/random.py :: generate_random(length=32)`
 
 ```
@@ -873,7 +491,7 @@ BEGIN
   Step 2. IF length > 1024 THEN
             RAISE HTTP_400 "Length cannot exceed 1024 bytes"
           END IF
-  Step 3. random_data ← Generate_Random_Bytes(length)     // §5.3
+  Step 3. random_data ← Generate_Random_Bytes(length)     // §4.3
   Step 4. RETURN 200 { length, random_data }
 END
 ```
@@ -885,14 +503,14 @@ rejects the degenerate empty output.
 
 ---
 
-### 7.4 ALG-EP-HASH — `POST /api/v1/hash/sha256`
+### 6.4 ALG-EP-HASH — `POST /api/v1/hash/sha256`
 `api/routes/hashing.py :: generate_sha256()`
 
 ```
 ALGORITHM Endpoint_SHA256(request)
 BEGIN
   Step 1. request.data ← Pydantic(HashRequest).data        // required str
-  Step 2. digest ← SHA256(request.data)                    // §5.4
+  Step 2. digest ← SHA256(request.data)                    // §4.4
   Step 3. RETURN 200 { algorithm:"SHA-256", hash: digest }
 END
 ```
@@ -902,7 +520,7 @@ path and the highest throughput.
 
 ---
 
-### 7.5 ALG-EP-SIGN — `POST /api/v1/ecdsa/sign`
+### 6.5 ALG-EP-SIGN — `POST /api/v1/ecdsa/sign`
 `api/routes/ecdsa.py :: create_signature()`
 
 ```
@@ -911,13 +529,13 @@ BEGIN
   Step 1. key_data ← _key_store.get(request.key_id)
   Step 2. IF key_data = NULL THEN RAISE HTTP_404 "Key not found"
   Step 3. SK ← key_data.private_key              // internal; never serialized
-  Step 4. signature ← ECDSA_Sign(SK, request.data)        // §5.5
+  Step 4. signature ← ECDSA_Sign(SK, request.data)        // §4.5
   Step 5. RETURN 200 { algorithm:"ECDSA", curve:"secp256r1",
                        key_id: request.key_id, signature }
 END
 ```
 
-### 7.6 ALG-EP-VERIFY — `POST /api/v1/ecdsa/verify`
+### 6.6 ALG-EP-VERIFY — `POST /api/v1/ecdsa/verify`
 `api/routes/ecdsa.py :: verify_ecdsa_signature()`
 
 ```
@@ -926,7 +544,7 @@ BEGIN
   Step 1. key_data ← _key_store.get(request.key_id)
   Step 2. IF key_data = NULL THEN RAISE HTTP_404 "Key not found"
   Step 3. PK ← key_data.public_key
-  Step 4. valid ← ECDSA_Verify(PK, request.data, request.signature)  // §5.6
+  Step 4. valid ← ECDSA_Verify(PK, request.data, request.signature)  // §4.6
   Step 5. RETURN 200 { algorithm:"ECDSA", key_id, valid }  // 200 even if False
 END
 ```
@@ -938,7 +556,7 @@ from "you referenced a key that does not exist" (an addressing error).
 
 ---
 
-### 7.7 ALG-EP-ECDH — `POST /api/v1/ecdh/derive`
+### 6.7 ALG-EP-ECDH — `POST /api/v1/ecdh/derive`
 `api/routes/ecdh.py :: derive_ecdh_secret()`
 
 ```
@@ -950,7 +568,7 @@ BEGIN
   Step 4. IF peer_data = NULL THEN RAISE HTTP_404 "Peer key not found"
   Step 5. SK_A ← priv_data.private_key
   Step 6. PK_B ← peer_data.public_key
-  Step 7. secret ← ECDH_Derive(SK_A, PK_B)                // §5.7
+  Step 7. secret ← ECDH_Derive(SK_A, PK_B)                // §4.7
   Step 8. RETURN 200 { algorithm:"ECDH", curve:"secp256r1",
                        shared_secret: secret }
 END
@@ -964,13 +582,13 @@ make mis-addressing debuggable.
 
 ---
 
-### 7.8 ALG-EP-APIKEY — `POST /api/v1/auth/api-key`
+### 6.8 ALG-EP-APIKEY — `POST /api/v1/auth/api-key`
 `api/routes/auth.py :: create_api_key()`
 
 ```
 ALGORITHM Endpoint_Create_API_Key()
 BEGIN
-  Step 1. result ← Generate_API_Key()           // §5.8
+  Step 1. result ← Generate_API_Key()           // §4.8
   Step 2. RETURN 200 result                     // {key_id, api_key}
 END
 ```
@@ -980,9 +598,9 @@ The client **must persist** `api_key` at `Step 2`: the server keeps only
 
 ---
 
-## 8. MASTER END-TO-END ALGORITHMS
+## 7. MASTER END-TO-END ALGORITHMS
 
-### 8.1 ALG-FLOW-SIGNVERIFY — Authenticity Workflow
+### 7.1 ALG-FLOW-SIGNVERIFY — Authenticity Workflow
 
 ```
 Sender                                    Receiver
@@ -1002,10 +620,10 @@ Sender                                    Receiver
 ```
 ALGORITHM Flow_Authenticity()
 BEGIN
-  Step 1. issue  ← Endpoint_Generate_Keys()              // §7.1
+  Step 1. issue  ← Endpoint_Generate_Keys()              // §6.1
   Step 2. share  ← publish issue.public_key to counterparty
-  Step 3. sig    ← Endpoint_ECDSA_Sign({issue.key_id, msg})   // §7.5
-  Step 4. verdict← Endpoint_ECDSA_Verify({issue.key_id, msg, sig})  // §7.6
+  Step 3. sig    ← Endpoint_ECDSA_Sign({issue.key_id, msg})   // §6.5
+  Step 4. verdict← Endpoint_ECDSA_Verify({issue.key_id, msg, sig})  // §6.6
   Step 5. IF verdict.valid = TRUE
             THEN accept msg as authentic and untampered
             ELSE reject msg (message altered, or wrong key, or forged sig)
@@ -1013,7 +631,7 @@ BEGIN
 END
 ```
 
-### 8.2 ALG-FLOW-ECDH — Confidential Channel Establishment
+### 7.2 ALG-FLOW-ECDH — Confidential Channel Establishment
 
 ```
 A (client)                                  B (client)
@@ -1031,14 +649,14 @@ ALGORITHM Flow_Confidential_Channel()
 BEGIN
   Step 1. (key_id_A, PK_A) ← Endpoint_Generate_Keys()     // party A
   Step 2. (key_id_B, PK_B) ← Endpoint_Generate_Keys()     // party B
-  Step 3. S_A ← Endpoint_ECDH_Derive({key_id_A, key_id_B})  // §7.7
-  Step 4. S_B ← Endpoint_ECDH_Derive({key_id_B, key_id_A})  // §7.7
-  Step 5. ASSERT S_A = S_B            // guaranteed by the §5.7 symmetry proof
+  Step 3. S_A ← Endpoint_ECDH_Derive({key_id_A, key_id_B})  // §6.7
+  Step 4. S_B ← Endpoint_ECDH_Derive({key_id_B, key_id_A})  // §6.7
+  Step 5. ASSERT S_A = S_B            // guaranteed by the §4.7 symmetry proof
   Step 6. USE S_A as the symmetric session key (e.g. AES-GCM input key)
 END
 ```
 
-### 8.3 ALG-FLOW-INTEGRITY — Hash-Based Integrity Check
+### 7.3 ALG-FLOW-INTEGRITY — Hash-Based Integrity Check
 
 ```
 ALGORITHM Flow_Integrity(payload)
@@ -1052,23 +670,23 @@ BEGIN
 END
 ```
 
-> A bare hash detects accidental corruption; pairing it with §8.1 (sign the
+> A bare hash detects accidental corruption; pairing it with §7.1 (sign the
 > digest instead of the payload) additionally provides authenticity.
 
-### 8.4 ALG-FLOW-RANDOM — CSPRNG Delivery
+### 7.4 ALG-FLOW-RANDOM — CSPRNG Delivery
 
 ```
 ALGORITHM Flow_Secure_Random(n)
 BEGIN
-  Step 1. IF n ∉ (0, 1024] THEN RETURN HTTP_400     // §7.3 guards
-  Step 2. hex ← OS_CSPRNG(n) → hex                  // §5.3
+  Step 1. IF n ∉ (0, 1024] THEN RETURN HTTP_400     // §6.3 guards
+  Step 2. hex ← OS_CSPRNG(n) → hex                  // §4.3
   Step 3. RETURN hex     // usable for nonces, salts, IVs, session IDs
 END
 ```
 
 ---
 
-## 9. APPLICATION STARTUP ALGORITHM
+## 8. APPLICATION STARTUP ALGORITHM
 
 `main.py`
 
@@ -1102,7 +720,7 @@ END
 
 ---
 
-## 10. COMPLEXITY ANALYSIS
+## 9. COMPLEXITY ANALYSIS
 
 | Algorithm | Time | Space | Dominant cost |
 |-----------|------|-------|---------------|
@@ -1128,7 +746,7 @@ SHA-256 = 32 bytes (64 hex), P-256 DER signature = 70–72 bytes.
 
 ---
 
-## 11. VALIDATION ALGORITHM (TEST SUITE)
+## 10. VALIDATION ALGORITHM (TEST SUITE)
 
 `tests/*.py` — 5 files, exercising the API through `fastapi.testclient.TestClient`.
 
@@ -1161,7 +779,7 @@ END
 | `test_ecdsa_sign` | sign returns 200, algorithm tag, non-empty signature |
 | `test_ecdsa_verify_valid_signature` | completeness: valid ⇒ `valid == True` |
 | `test_ecdsa_verify_invalid_signature` | soundness: altered data ⇒ `valid == False` |
-| `test_ecdh_shared_secret_matches` | symmetry: `S_A == S_B` (§5.7 proof) |
+| `test_ecdh_shared_secret_matches` | symmetry: `S_A == S_B` (§4.7 proof) |
 | `test_ecdh_missing_private_key` | 404 on unknown private key |
 | `test_ecdh_missing_peer_key` | 404 on unknown peer key |
 
@@ -1183,121 +801,9 @@ END
 python -m pytest tests -q          # add -v for per-test names
 ```
 
-> **Verified:** with `fastapi 0.142.2`, `cryptography 50.0.2`, `pydantic 2.13.5`,
-> `pytest 9.1.1` and `httpx 0.28.1` installed under Python 3.11.9, the suite runs
-> green — **17 passed** (≈ 0.8 s). One benign Starlette deprecation warning about
-> `httpx`/`httpx2` is emitted by `TestClient`.
-
 ---
 
-## 12. IMPLEMENTATION OBSERVATIONS & ALGORITHM-LEVEL GAPS
-
-The algorithm above faithfully describes the code as written. Reviewing it as
-a whole surfaced several points worth recording in the report (each is an
-*implementation* issue, not a flaw in the cryptographic design).
-
-**Resolution status** (re-verified by running the suite — see §11):
-
-| Item | Issue | Status |
-|------|-------|--------|
-| §12.1 | missing `app/` package | ✅ Fixed — modules moved under `app/` |
-| §12.2 | dashboard path resolved to `templates/templates/…` | ✅ Fixed — `main.py` now at `app/main.py`; `GET /` returns the dashboard (19 055 bytes) |
-| §12.3 | `auth` router never mounted | ✅ Fixed — registered in `Bootstrap_Application()` |
-| §12.6 | duplicate imports in `ecdsa.py` | ✅ Fixed — single import block |
-| §12.4 | `require_api_key` not applied to routes | ⚠️ Open — left deliberately; see the note below |
-| §12.5 | in-memory stores | ⚠️ Open — by design; needs a persistence backend |
-| §12.7 | cosmetic style | ⚠️ Open — non-functional |
-
-The sections below retain the original analysis for the record.
-
-### 12.1 Package-path mismatch (would block startup)
-Every module imports through an `app.` package:
-`from app.main import app`, `from app.api.routes import ...`,
-`from app.core...`, `from app.services...`, `from app.schemas...`.
-On disk the packages are flattened at the repository root and there is **no
-`app/` package**, so `python -m pytest tests` raises
-`ModuleNotFoundError: No module named 'app'`.
-
-**Algorithm-preserving fix (either is fine):**
-- Create an `app/` package directory and move `api/`, `core/`, `services/`,
-  `schemas/`, `main.py` inside it, with `main.py` at `app/main.py`; **or**
-- Rewrite the imports to drop the `app.` prefix (e.g.
-  `from core.key_manager import KeyManager`).
-
-### 12.2 `main.py` location vs. its own path logic
-`main.py` lives in `templates/`, yet it computes
-`Path(__file__).parent / "templates" / "dashboard.html"`.
-That resolves to `templates/templates/dashboard.html`, which does not exist,
-so `GET /` would fail. Placing `main.py` one level above `templates/`
-(i.e. at the package root, per §12.1) makes the path correct.
-
-### 12.3 The `auth` router is never mounted
-§9 shows `main.py` registers keys/random/hashing/ecdsa/ecdh but **not**
-`auth.router`. Therefore `POST /api/v1/auth/api-key` is currently unreachable
-— no client can obtain the API key that §6.3 would consume.
-**Fix:** `app.include_router(auth.router)` in `Bootstrap_Application()`.
-
-### 12.4 API-key enforcement is defined but not applied
-`require_api_key` (§6.3) exists and is correct, but **no route declares
-`Depends(require_api_key)`**. Consequently all five mounted endpoint groups
-are currently public. To close the loop, the algorithm should read:
-
-```
-@router.post("/sign")
-def create_signature(request: SignRequest,
-                     api_key: str = Depends(require_api_key)):
-    ...
-```
-
-and likewise for `ecdsa/verify`, `ecdh/derive`, `keys/*`. `hash`, `random`
-and `keys/generate` are reasonable candidates for a public tier.
-
-> **Why it was left open:** the existing `tests/*.py` call every endpoint
-> *without* an `X-API-Key` header. Attaching the dependency would therefore
-> turn all 17 tests into `401` failures. Applying it correctly is a two-part
-> change — wire `Depends(require_api_key)` into the routes **and** update the
-> tests to first `POST /api/v1/auth/api-key` and send the returned key in the
-> header. That is a deliberate design decision for the report, not an
-> oversight.
-
-### 12.5 Stores are in-memory only
-Both `_key_store` and `_api_key_store` are module-level dicts (the code
-comments acknowledge "later this will be replaced with a database").
-Consequences the report should state explicitly:
-- keys and API keys **vanish on process restart**;
-- state is **per-worker**, so it breaks under multiple uvicorn workers;
-- there is no key expiry, rotation or audit log.
-`active: True` in the API-key record is already the right hook for a
-`revoke_api_key()` companion algorithm.
-
-### 12.6 Minor code hygiene in `api/routes/ecdsa.py`
-The module contains duplicate imports of `SignRequest`, `VerifyRequest`,
-`sign_data` and `verify_signature` (lines 3–7). Harmless at runtime, but a
-linter/report reviewer will flag it — collapse to one import block.
-
-### 12.7 Cosmetic inconsistency
-`services/random_service.py` has no blank line after `import secrets`, and
-`services/key_service.py` uses a module-level singleton store; a light pass
-with `ruff`/`black` would normalise style across the layers.
-
-### 12.8 What is already done well (worth claiming in the report)
-1. **Separation of concerns** — a genuine 3-layer architecture with a facade
-   (`SecurityEngine`, `KeyManager`) between HTTP and crypto.
-2. **Private-key containment (I1)** — `SK` is never serialized in any response
-   path; only PEM `PK` is exported.
-3. **One-way API-key storage** — only `SHA256(api_key)` is persisted.
-4. **Correct use of vetted primitives** — no hand-rolled curve math, no
-   `random` module in any security path, low-S via the library, on-curve
-   validation via OpenSSL.
-5. **Error containment (I5)** — `InvalidSignature` is converted to `False` at
-   Layer 1, so routes never leak stack traces.
-6. **Boundary validation** — Pydantic schemas plus explicit 400/404 guards.
-7. **A meaningful test suite** covering completeness, soundness, symmetry,
-   non-determinism, length discipline and negative paths.
-
----
-
-## 13. QUICK REFERENCE — ALGORITHM–FILE INDEX
+## 11. QUICK REFERENCE — ALGORITHM–FILE INDEX
 
 All file paths are relative to the `app/` package
 (e.g. `services/key_service.py` ⇒ `app/services/key_service.py`).
